@@ -212,9 +212,17 @@ create table if not exists wsl5_private.votes (
   choice integer not null check (choice between 0 and 3),
   primary key (poll_id, voter_hash)
 );
+create table if not exists wsl5_private.moderation_notes (
+  room text not null references wsl5_private.rooms(code) on delete cascade,
+  page integer not null,
+  content text not null default '' check (length(content)<=20000),
+  revision integer not null default 1,
+  primary key (room,page)
+);
 alter table wsl5_private.rooms enable row level security;
 alter table wsl5_private.polls enable row level security;
 alter table wsl5_private.votes enable row level security;
+alter table wsl5_private.moderation_notes enable row level security;
 revoke all on all tables in schema wsl5_private from public, anon, authenticated;
 
 create or replace function wsl5_private.load_room(p_room text, p_key text default '', p_host boolean default false)
@@ -248,7 +256,7 @@ end $$;
 
 create or replace function public.wsl5_ping()
 returns jsonb language sql security definer set search_path = '' as $$
-  select jsonb_build_object('service','wsl5','version',1);
+  select jsonb_build_object('service','wsl5','version',2);
 $$;
 
 create or replace function public.wsl5_create_room(p_story jsonb, p_pages jsonb)
@@ -320,7 +328,32 @@ begin
   end if;
   return jsonb_build_object('revision',r.revision,'page',(r.pages->>r.step)::integer,
     'phase',r.phase,'selected',r.choices,'poll',v_poll,'ended',r.ended,
-    'atStart',r.step=0,'atEnd',r.step=jsonb_array_length(r.pages)-1);
+    'atStart',r.step=0,'atEnd',r.step=jsonb_array_length(r.pages)-1)
+    || case when coalesce(p_key,'')<>'' then jsonb_build_object('moderationNotes',
+      coalesce((select jsonb_object_agg(n.page,jsonb_build_object('text',n.content,'revision',n.revision))
+        from wsl5_private.moderation_notes n where n.room=r.code),'{}'::jsonb))
+      else '{}'::jsonb end;
+end $$;
+
+-- Notizen liegen außerhalb der öffentlichen Story. Lesen und Schreiben brauchen den privaten Link.
+create or replace function public.wsl5_save_note(p_room text,p_key text,p_page integer,p_text text,p_revision integer)
+returns jsonb language plpgsql security definer set search_path = '' as $$
+declare r wsl5_private.rooms; n wsl5_private.moderation_notes; v_revision integer;
+begin
+  perform 1 from wsl5_private.rooms where code=upper(p_room) for update;
+  r:=wsl5_private.load_room(p_room,p_key,true);
+  if p_page is null or not exists(select 1 from jsonb_array_elements(r.pages) item where item.value=to_jsonb(p_page)) then
+    raise exception 'Diese Seite gehört nicht zur Session.';
+  end if;
+  if p_text is null or length(p_text)>20000 then raise exception 'Die Notiz darf höchstens 20.000 Zeichen enthalten.'; end if;
+  select * into n from wsl5_private.moderation_notes where room=r.code and page=p_page;
+  v_revision:=coalesce(n.revision,0);
+  if p_revision is distinct from v_revision then
+    raise exception using errcode='40001',message='Die andere Moderatorin hat diese Notiz inzwischen geändert. Bitte beide Fassungen vergleichen.';
+  end if;
+  insert into wsl5_private.moderation_notes(room,page,content,revision) values(r.code,p_page,p_text,v_revision+1)
+    on conflict(room,page) do update set content=excluded.content,revision=excluded.revision;
+  return jsonb_build_object('page',p_page,'text',p_text,'revision',v_revision+1);
 end $$;
 
 create or replace function public.wsl5_host_action(p_room text,p_key text,p_revision integer,p_action text,p_choice integer default null)
@@ -399,12 +432,14 @@ revoke all on function public.wsl5_get_story(text) from public;
 revoke all on function public.wsl5_state(text,text) from public;
 revoke all on function public.wsl5_host_action(text,text,integer,text,integer) from public;
 revoke all on function public.wsl5_vote(text,uuid,text,integer) from public;
+revoke all on function public.wsl5_save_note(text,text,integer,text,integer) from public;
 grant execute on function public.wsl5_ping() to anon,authenticated;
 grant execute on function public.wsl5_create_room(jsonb,jsonb) to anon,authenticated;
 grant execute on function public.wsl5_get_story(text) to anon,authenticated;
 grant execute on function public.wsl5_state(text,text) to anon,authenticated;
 grant execute on function public.wsl5_host_action(text,text,integer,text,integer) to anon,authenticated;
 grant execute on function public.wsl5_vote(text,uuid,text,integer) to anon,authenticated;
+grant execute on function public.wsl5_save_note(text,text,integer,text,integer) to anon,authenticated;
 notify pgrst, 'reload schema';
 commit;
 </script><script id="online-app">
@@ -491,7 +526,7 @@ const A=window.WSL5={view,room:(params.get('room')||'').toUpperCase(),hostKey:''
         if(response.status===404||code==='PGRST202')message='Die Abstimmungsfunktionen fehlen in diesem Supabase-Projekt. Öffne „Supabase einrichten“, kopiere den SQL-Code und führe ihn vollständig im SQL Editor aus. Danach die Verbindung erneut prüfen.';
         else if(response.status===401)message='Supabase akzeptiert den Schlüssel nicht. Bitte Projekt-URL und öffentlichen Publishable Key aus demselben Projekt erneut eintragen.';
         else if(response.status===403||code==='42501')message='Supabase verweigert den Zugriff. Bitte den vollständigen SQL-Code aus „Supabase einrichten“ im selben Projekt ausführen. Die Zugriffseinstellungen nicht pauschal ausschalten.';
-        throw Error(message+(code?'\nFehlercode: '+code:''));
+        const error=Error(message+(code?'\nFehlercode: '+code:''));error.code=code;throw error;
       }
       return result;
     }catch(e){if(e.name==='AbortError')throw Error('Supabase antwortet gerade nicht. Bitte erneut versuchen.');if(e instanceof TypeError)throw Error('Keine Verbindung zu Supabase. Prüfe die Internetverbindung und ob die Projekt-URL erreichbar ist.');throw e}finally{clearTimeout(timeout)}
@@ -622,5 +657,125 @@ document.addEventListener('keydown',e=>{
 window.addEventListener('focus',()=>{if(A.live&&A.state&&!A.busy)A.refresh()});
 window.addEventListener('pagehide',()=>clearTimeout(A.timer));
 A.init().catch(e=>A.lobby(e.message));
+})();
+</script><script id="moderation-notes-app">
+/* Private Notizen werden getrennt von der Story gespeichert und nur mit dem Moderationsschlüssel geladen. */
+(()=>{
+'use strict';
+const A=window.WSL5;
+if(!A?.host)return;
+const draftKey='wsl5-private-note-drafts:'+A.room;
+const entries=new Map();
+try{
+  const saved=JSON.parse(localStorage.getItem(draftKey)||'[]');
+  if(Array.isArray(saved))for(const item of saved){
+    if(!Number.isInteger(item.page)||typeof item.text!=='string'||item.text.length>20000)continue;
+    entries.set(String(item.page),{text:item.text,baseText:typeof item.baseText==='string'?item.baseText:'',revision:Number.isInteger(item.revision)?item.revision:0,dirty:true,saving:false,conflict:false,error:'',timer:null,cached:true});
+  }
+}catch{}
+const style=document.createElement('style');
+style.id='moderation-notes-css';
+style.textContent=`#moderation-notes-panel{max-width:1200px;margin:0 auto 40px;padding:0 24px}#moderation-notes-panel[hidden]{display:none!important}.moderation-notes-card{border:2px solid #e20074;background:#fff}.moderation-notes-card h2{margin:6px 0}.moderation-notes-card label{display:block;font-weight:700;margin-top:18px}.moderation-notes-card textarea{min-height:210px;resize:vertical;font:17px/1.6 system-ui;white-space:pre-wrap}.moderation-notes-card .notes-status{font:14px/1.5 system-ui;min-height:22px}.notes-remote{padding:14px;border-radius:12px;background:#fff3e4}.notes-remote pre{white-space:pre-wrap;overflow-wrap:anywhere;font:15px/1.6 system-ui;max-height:240px;overflow:auto}.notes-warning{color:#982e2e}@media(max-width:750px){#moderation-notes-panel{padding:0 14px}.moderation-notes-card{padding:20px}}@media print{#moderation-notes-panel{display:none!important}}`;
+document.head.append(style);
+const area=document.createElement('section');
+area.id='moderation-notes-panel';area.hidden=true;
+area.setAttribute('aria-label','Private Moderationsnotizen');
+area.innerHTML=`<div class="card moderation-notes-card"><div class="tag">Nur für Claudia und Carolin</div><h2>Moderationsnotizen</h2><p id="notes-page" class="small"></p><p id="notes-hint" class="small">Hier könnt ihr Sprechtexte, Hintergrundinformationen und Hinweise eintragen. Die Notizen werden für beide Moderatorinnen gespeichert. Publikum und Präsentationsfenster erhalten sie nicht.</p><p id="notes-upgrade" class="notice" hidden>Für gemeinsame Notizen ist einmal der aktualisierte SQL-Code nötig. Öffne „Supabase einrichten“, kopiere dort den vollständigen SQL-Code und führe ihn im SQL Editor aus. Deine Eingaben bleiben bis dahin als Entwurf auf diesem Browser.<br><button id="notes-setup">Supabase einrichten</button></p><label for="notes-text">Notizen für diese Seite</label><textarea id="notes-text" maxlength="20000" placeholder="Zum Beispiel: Claudia übernimmt die Einordnung. Carolin stellt die nächste Frage …" aria-describedby="notes-hint notes-status"></textarea><p id="notes-status" class="notes-status" role="status" aria-live="polite"></p><div class="online-actions"><button id="notes-save" class="primary">Notiz speichern</button></div><div id="notes-conflict" class="notes-remote" hidden><b>Die andere Moderatorin hat diese Notiz geändert.</b><p>Dein Entwurf steht weiterhin im Eingabefeld. Vergleiche ihn mit dem zuletzt gespeicherten Stand:</p><pre id="notes-remote"></pre><div class="online-actions"><button id="notes-load">Gespeicherten Stand laden</button><button id="notes-overwrite">Meinen Entwurf stattdessen speichern</button></div></div></div>`;
+document.getElementById('online-panel').after(area);
+const $=id=>document.getElementById('notes-'+id);
+const N=window.WSL5Notes={entries,current:null,supported:false,connected:false,
+  entry(id){
+    id=String(id);
+    if(!entries.has(id))entries.set(id,{text:'',baseText:'',revision:0,dirty:false,saving:false,conflict:false,error:'',timer:null,cached:true});
+    return entries.get(id);
+  },
+  cache(){
+    const drafts=[...entries].filter(([,d])=>d.dirty).map(([id,d])=>({page:Number(id),text:d.text,baseText:d.baseText,revision:d.revision}));
+    try{if(drafts.length)localStorage.setItem(draftKey,JSON.stringify(drafts));else localStorage.removeItem(draftKey);for(const d of entries.values())d.cached=true;}
+    catch{for(const d of entries.values())if(d.dirty)d.cached=false;}
+  },
+  remote(id){
+    const n=A.state?.moderationNotes?.[String(id)];
+    return n&&typeof n.text==='string'&&Number.isInteger(n.revision)&&n.revision>0?{text:n.text,revision:n.revision}:{text:'',revision:0};
+  },
+  merge(){
+    const state=A.state;if(!state)return;
+    this.supported=Object.hasOwn(state,'moderationNotes');
+    const recovered=!this.connected&&A.online;this.connected=A.online;
+    if(this.supported){
+      const ids=new Set([...Object.keys(state.moderationNotes||{}),...entries.keys(),String(state.page)]);
+      for(const id of ids){
+        const d=this.entry(id),r=this.remote(id);
+        if(d.saving||r.revision<d.revision)continue;
+        if(!d.dirty||d.text===r.text){d.text=r.text;d.baseText=r.text;d.revision=r.revision;d.dirty=false;d.conflict=false;d.error='';}
+        else if(r.revision>d.revision){
+          if(r.text===d.baseText){d.revision=r.revision;}
+          else{d.conflict=true;clearTimeout(d.timer);}
+        }
+      }
+      this.cache();
+      if(recovered)for(const [id,d]of entries)if(d.dirty&&!d.conflict&&!d.saving&&!d.error)this.schedule(id);
+    }
+  },
+  schedule(id){
+    const d=this.entry(id);clearTimeout(d.timer);
+    if(!d.conflict)d.timer=setTimeout(()=>this.save(id),900);
+  },
+  input(text){
+    if(this.current===null)return;
+    const d=this.entry(this.current);d.text=text;d.dirty=text!==d.baseText;d.error='';
+    if(!d.dirty)d.conflict=false;
+    this.cache();this.schedule(this.current);this.render();
+  },
+  async save(id=this.current){
+    if(id===null)return;id=String(id);
+    const d=this.entry(id);clearTimeout(d.timer);
+    if(!d.dirty||d.saving||d.conflict||!this.supported||!A.online||!A.hostKey){this.render();return;}
+    const text=d.text,revision=d.revision;d.saving=true;d.error='';this.render();
+    try{
+      const result=await A.rpc('wsl5_save_note',{p_room:A.room,p_key:A.hostKey,p_page:Number(id),p_text:text,p_revision:revision});
+      if(result?.text!==text||!Number.isInteger(result.revision)||result.revision<=revision)throw Error('Das Speichern wurde nicht bestätigt. Der Entwurf bleibt erhalten.');
+      d.baseText=result.text;d.revision=result.revision;d.dirty=d.text!==text;d.conflict=false;
+    }catch(e){d.error=e.message||'Die Notiz konnte nicht gespeichert werden.';if(e.code==='40001')d.conflict=true;}
+    finally{d.saving=false;this.cache();this.render();if(d.dirty&&!d.conflict&&!d.error)this.schedule(id);A.refresh();}
+  },
+  load(){
+    const d=this.entry(this.current),r=this.remote(this.current);
+    if(d.dirty&&!confirm('Deinen Entwurf durch die gemeinsam gespeicherte Notiz ersetzen?'))return;
+    clearTimeout(d.timer);Object.assign(d,{text:r.text,baseText:r.text,revision:r.revision,dirty:false,conflict:false,error:''});
+    this.cache();this.render();
+  },
+  overwrite(){
+    const d=this.entry(this.current),r=this.remote(this.current);
+    Object.assign(d,{baseText:r.text,revision:r.revision,dirty:d.text!==r.text,conflict:false,error:''});
+    this.cache();this.save();
+  },
+  title(){const n=A.state.page;return n===-2?'Einstieg':n===-1?'Die Figuren':n===data.scenes.length?'Auflösung':n>=100?data.pageManager?.custom?.[n]?.title||'Eigene Seite':`Wegpunkt ${n+1} · ${data.scenes[n]?.title||''}`;},
+  render(){
+    if(!A.state){area.hidden=true;return;}
+    area.hidden=false;
+    const id=String(A.state.page),old=this.current;
+    this.current=id;
+    if(old!==null&&old!==id){const previous=this.entry(old);if(previous.dirty&&!previous.saving&&!previous.conflict&&!previous.error)this.save(old);}
+    const d=this.entry(id),field=$('text');
+    if(field.value!==d.text)field.value=d.text;
+    $('page').textContent=this.title();$('upgrade').hidden=this.supported;
+    $('save').disabled=!d.dirty||d.saving||d.conflict||!A.online||!this.supported;
+    $('save').textContent=d.saving?'Wird gespeichert …':d.error?'Erneut speichern':'Notiz speichern';
+    $('conflict').hidden=!d.conflict;
+    if(d.conflict)$('remote').textContent=this.remote(id).text||'(Noch kein Text gespeichert.)';
+    const status=d.saving?'Notiz wird für beide Moderatorinnen gespeichert …':d.conflict?'Zwei Fassungen vorhanden. Dein Entwurf bleibt erhalten.':d.error?d.error+' Dein Entwurf bleibt erhalten.':!this.supported?'Entwurf auf diesem Browser. Für gemeinsames Speichern bitte Supabase wie oben beschrieben aktualisieren.':!A.online?'Verbindung unterbrochen. Änderungen bleiben als Entwurf auf diesem Browser.':d.dirty?'Entwurf wird gleich gespeichert …':d.revision?'✓ Für Claudia und Carolin gespeichert.':'Noch keine Notiz für diese Seite.';
+    $('status').textContent=!d.cached&&d.dirty?status+' Achtung: Der Browser kann den Entwurf nicht dauerhaft sichern. Lass dieses Fenster geöffnet und kopiere den Text zur Sicherheit.':status;
+    $('status').classList.toggle('notes-warning',!!d.error||d.conflict||!d.cached);
+  }
+};
+$('text').addEventListener('input',e=>N.input(e.target.value));
+$('save').onclick=()=>N.save();$('load').onclick=()=>N.load();$('overwrite').onclick=()=>N.overwrite();$('setup').onclick=()=>A.setup();
+const update=A.updatePanel;
+A.updatePanel=function(){update.call(this);N.merge();N.render();};
+const lobby=A.lobby;
+A.lobby=function(message){lobby.call(this,message);area.hidden=true;};
+window.addEventListener('pagehide',()=>{N.cache();for(const d of entries.values())clearTimeout(d.timer);});
+N.merge();N.render();
 })();
 </script></body></html>
